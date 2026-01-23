@@ -46,13 +46,19 @@ app.post('/transcode', async (req, res) => {
     // Create temp directory
     await fs.promises.mkdir(tempDir, { recursive: true });
 
-    // Download video
+    // Download video (with optional Authorization header for OneDrive)
     console.log('Downloading video...');
+    const headers = {};
+    if (req.headers.authorization) {
+      headers.Authorization = req.headers.authorization;
+    }
+    
     const response = await axios({
       method: 'get',
       url: videoUrl,
       responseType: 'stream',
       timeout: 120000, // 2 minute timeout
+      headers
     });
 
     const writer = fs.createWriteStream(inputPath);
