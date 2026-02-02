@@ -6,6 +6,7 @@ const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const tus = require('tus-js-client');
 
 const execAsync = promisify(exec);
 
@@ -22,6 +23,54 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+/**
+ * Upload file to Supabase Storage using tus resumable upload protocol.
+ * No file size limit — handles any video size reliably.
+ */
+function tusUpload(bucketName, filePath, fileName, contentType) {
+  return new Promise((resolve, reject) => {
+    const fileStream = fs.createReadStream(filePath);
+    const fileSize = fs.statSync(filePath).size;
+
+    const upload = new tus.Upload(fileStream, {
+      endpoint: `${SUPABASE_URL}/storage/v1/upload/resumable`,
+      retryDelays: [0, 1000, 3000, 5000],
+      headers: {
+        authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'x-upsert': 'false',
+      },
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      metadata: {
+        bucketName: bucketName,
+        objectName: fileName,
+        contentType: contentType,
+        cacheControl: '3600',
+      },
+      uploadSize: fileSize,
+      onError: (error) => {
+        console.error('tus upload error:', error.message);
+        reject(new Error(`tus upload failed: ${error.message}`));
+      },
+      onProgress: (bytesUploaded, bytesTotal) => {
+        const pct = ((bytesUploaded / bytesTotal) * 100).toFixed(1);
+        console.log(`Upload progress: ${pct}% (${(bytesUploaded / 1024 / 1024).toFixed(1)}MB / ${(bytesTotal / 1024 / 1024).toFixed(1)}MB)`);
+      },
+      onSuccess: () => {
+        console.log(`tus upload complete: ${fileName} (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
+        resolve();
+      },
+    });
+
+    upload.findPreviousUploads().then((previousUploads) => {
+      if (previousUploads.length) {
+        upload.resumeFromPreviousUpload(previousUploads[0]);
+      }
+      upload.start();
+    });
+  });
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -75,31 +124,20 @@ app.post('/transcode', async (req, res) => {
     const ffmpegCmd = `ffmpeg -i "${inputPath}" -c:v libx264 -c:a aac -movflags +faststart -y "${outputPath}"`;
     const { stdout, stderr } = await execAsync(ffmpegCmd);
 
-    console.log('Transcoding complete, uploading to Supabase...');
+    const outputSize = fs.statSync(outputPath).size;
+    console.log(`Transcoding complete (${(outputSize / 1024 / 1024).toFixed(1)}MB), uploading to Supabase via tus...`);
 
-    // Read transcoded file
-    const fileBuffer = await fs.promises.readFile(outputPath);
     const fileName = `transcoded-${Date.now()}-${crypto.randomBytes(8).toString('hex')}.mp4`;
 
-    // Upload to Supabase Storage
-    const { data, error } = await supabase.storage
-      .from('social-media-temp')
-      .upload(fileName, fileBuffer, {
-        contentType: 'video/mp4',
-        cacheControl: '3600',
-        upsert: false
-      });
-
-    if (error) {
-      throw new Error(`Supabase upload error: ${error.message}`);
-    }
+    // Upload via tus resumable protocol — no file size limit
+    await tusUpload('social-media-temp', outputPath, fileName, 'video/mp4');
 
     // Get public URL
     const { data: { publicUrl } } = supabase.storage
       .from('social-media-temp')
       .getPublicUrl(fileName);
 
-    console.log(`Transcoding complete: ${publicUrl}`);
+    console.log(`Upload complete: ${publicUrl}`);
 
     // Cleanup temp files
     await fs.promises.rm(tempDir, { recursive: true, force: true });
