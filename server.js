@@ -28,6 +28,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_TUS_KEY = process.env.SUPABASE_TUS_KEY || SUPABASE_SERVICE_KEY; // JWT key for tus uploads
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
@@ -83,7 +84,7 @@ function tusUpload(bucketName, filePath, fileName, contentType) {
       endpoint: `${SUPABASE_URL}/storage/v1/upload/resumable`,
       retryDelays: [0, 1000, 3000, 5000],
       headers: {
-        authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        authorization: `Bearer ${SUPABASE_TUS_KEY}`,
         'x-upsert': 'true',
       },
       uploadDataDuringCreation: true,
