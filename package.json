@@ -11,7 +11,9 @@
     "axios": "^1.6.5",
     "@supabase/supabase-js": "^2.39.3",
     "tus-js-client": "^4.2.3",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pino": "^9.5.0",
+    "@logtail/pino": "^0.5.2"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -8,8 +8,18 @@ const path = require('path');
 const crypto = require('crypto');
 const tus = require('tus-js-client');
 const jwt = require('jsonwebtoken');
+const { createLogger, logger } = require('./lib/logger');
 
 const execAsync = promisify(exec);
+
+// Component loggers
+const log = {
+  server: createLogger({ component: 'server' }),
+  transcode: createLogger({ component: 'transcode' }),
+  upload: createLogger({ component: 'upload' }),
+  auth: createLogger({ component: 'auth' }),
+  db: createLogger({ component: 'db' }),
+};
 
 const app = express();
 app.use(express.json());
@@ -32,7 +42,7 @@ const SUPABASE_TUS_KEY = process.env.SUPABASE_TUS_KEY || SUPABASE_SERVICE_KEY; /
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_KEY');
+  log.server.fatal('Missing required environment variables: SUPABASE_URL, SUPABASE_SERVICE_KEY');
   process.exit(1);
 }
 
@@ -52,14 +62,14 @@ function verifyAuth(req) {
   }
 
   const token = authHeader.substring(7);
-  
+
   try {
     // If we have JWT secret, verify the token
     if (SUPABASE_JWT_SECRET) {
       const decoded = jwt.verify(token, SUPABASE_JWT_SECRET);
       return { success: true, userId: decoded.sub, token };
     }
-    
+
     // Fallback: decode without verification (less secure, but works without secret)
     const decoded = jwt.decode(token);
     if (!decoded || !decoded.sub) {
@@ -67,6 +77,7 @@ function verifyAuth(req) {
     }
     return { success: true, userId: decoded.sub, token };
   } catch (err) {
+    log.auth.warn({ err, reason: 'token_verification_failed' }, 'JWT verification failed');
     return { success: false, error: 'Token verification failed: ' + err.message };
   }
 }
@@ -97,15 +108,15 @@ function tusUpload(bucketName, filePath, fileName, contentType) {
       },
       uploadSize: fileSize,
       onError: (error) => {
-        console.error('tus upload error:', error.message);
+        log.upload.error({ err: error, bucket: bucketName, fileName, fileSizeMB: +(fileSize / 1024 / 1024).toFixed(1) }, 'tus upload failed');
         reject(new Error(`tus upload failed: ${error.message}`));
       },
       onProgress: (bytesUploaded, bytesTotal) => {
         const pct = ((bytesUploaded / bytesTotal) * 100).toFixed(1);
-        console.log(`Upload progress: ${pct}% (${(bytesUploaded / 1024 / 1024).toFixed(1)}MB / ${(bytesTotal / 1024 / 1024).toFixed(1)}MB)`);
+        log.upload.debug({ bucket: bucketName, fileName, pct, bytesUploaded, bytesTotal }, 'Upload progress');
       },
       onSuccess: () => {
-        console.log(`tus upload complete: ${fileName} (${(fileSize / 1024 / 1024).toFixed(1)}MB)`);
+        log.upload.info({ bucket: bucketName, fileName, fileSizeMB: +(fileSize / 1024 / 1024).toFixed(1) }, 'tus upload complete');
         resolve();
       },
     });
@@ -139,7 +150,7 @@ async function transcodeVideo(inputPath, outputPath) {
     -b:a 128k \
     -movflags +faststart \
     -y "${outputPath}"`;
-  
+
   await execAsync(ffmpegCmd);
   return outputPath;
 }
@@ -163,8 +174,8 @@ async function processVideo(jobId, videoRecord, userId) {
       .from('product-videos')
       .getPublicUrl(videoRecord.storage_path);
 
-    console.log(`[${jobId}] Downloading video from: ${sourceUrl}`);
-    
+    log.transcode.info({ jobId, sourceUrl, videoId: videoRecord.id }, 'Downloading video');
+
     // Download video
     const response = await axios({
       method: 'get',
@@ -182,14 +193,14 @@ async function processVideo(jobId, videoRecord, userId) {
     });
 
     const inputSize = fs.statSync(inputPath).size;
-    console.log(`[${jobId}] Downloaded ${(inputSize / 1024 / 1024).toFixed(1)}MB, transcoding...`);
+    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1) }, 'Download complete, transcoding');
     jobStatus.set(jobId, { status: 'processing', step: 'transcoding', progress: 30 });
 
     // Transcode
     await transcodeVideo(inputPath, outputPath);
 
     const outputSize = fs.statSync(outputPath).size;
-    console.log(`[${jobId}] Transcoded: ${(inputSize / 1024 / 1024).toFixed(1)}MB → ${(outputSize / 1024 / 1024).toFixed(1)}MB`);
+    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1), outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1) }, 'Transcode complete');
     jobStatus.set(jobId, { status: 'processing', step: 'uploading', progress: 70 });
 
     // Upload transcoded video
@@ -213,23 +224,24 @@ async function processVideo(jobId, videoRecord, userId) {
       .eq('id', videoRecord.id);
 
     if (updateError) {
+      log.db.error({ err: updateError, jobId, videoId: videoRecord.id }, 'Failed to update video record after transcode');
       throw new Error(`Failed to update DB: ${updateError.message}`);
     }
 
-    console.log(`[${jobId}] Processing complete: ${transcodedUrl}`);
-    jobStatus.set(jobId, { 
-      status: 'completed', 
-      step: 'done', 
+    log.transcode.info({ jobId, transcodedUrl, videoId: videoRecord.id }, 'Processing complete');
+    jobStatus.set(jobId, {
+      status: 'completed',
+      step: 'done',
       progress: 100,
-      transcodedUrl 
+      transcodedUrl
     });
 
     // Cleanup temp files
     await fs.promises.rm(tempDir, { recursive: true, force: true });
 
   } catch (error) {
-    console.error(`[${jobId}] Processing error:`, error.message);
-    
+    log.transcode.error({ err: error, jobId, videoId: videoRecord.id }, 'Video processing failed');
+
     // Update DB with error status
     await supabase
       .from('product_videos')
@@ -238,19 +250,19 @@ async function processVideo(jobId, videoRecord, userId) {
         error_message: error.message,
       })
       .eq('id', videoRecord.id)
-      .catch(err => console.error('Failed to update error status:', err));
+      .catch(err => log.db.error({ err, jobId, videoId: videoRecord.id }, 'Failed to update error status in DB'));
 
-    jobStatus.set(jobId, { 
-      status: 'failed', 
-      step: 'error', 
-      error: error.message 
+    jobStatus.set(jobId, {
+      status: 'failed',
+      step: 'error',
+      error: error.message
     });
 
     // Cleanup on error
     try {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
     } catch (cleanupError) {
-      console.error('Cleanup error:', cleanupError);
+      log.server.warn({ err: cleanupError, tempDir }, 'Temp directory cleanup failed');
     }
   }
 }
@@ -264,7 +276,7 @@ app.get('/health', (req, res) => {
  * POST /api/video/register
  * Register a video after it's been uploaded to Supabase Storage
  * Saves metadata and triggers transcoding
- * 
+ *
  * Body: {
  *   storagePath: string,  // Path in product-videos bucket
  *   productId: string,    // UUID of sourced_product
@@ -307,15 +319,18 @@ app.post('/api/video/register', async (req, res) => {
       .single();
 
     if (insertError) {
+      log.db.error({ err: insertError, userId: auth.userId, storagePath }, 'Failed to create video record');
       throw new Error(`Failed to create video record: ${insertError.message}`);
     }
 
     // Generate job ID
     const jobId = `job_${videoRecord.id}`;
 
+    log.transcode.info({ jobId, videoId: videoRecord.id, userId: auth.userId, storagePath }, 'Video registered, starting transcode');
+
     // Start async transcoding (don't await)
     processVideo(jobId, videoRecord, auth.userId).catch(err => {
-      console.error(`Background processing failed for ${jobId}:`, err);
+      log.transcode.error({ err, jobId }, 'Background processing failed');
     });
 
     res.json({
@@ -327,10 +342,10 @@ app.post('/api/video/register', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    log.server.error({ err: error, route: 'POST /api/video/register', userId: auth.userId }, 'Register endpoint error');
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
@@ -361,9 +376,9 @@ app.get('/api/video/status/:jobId', async (req, res) => {
     .single();
 
   if (error || !video) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Job not found' 
+    return res.status(404).json({
+      success: false,
+      error: 'Job not found'
     });
   }
 
@@ -389,18 +404,18 @@ app.post('/transcode', async (req, res) => {
   const outputPath = path.join(tempDir, 'output.mp4');
 
   try {
-    console.log(`Transcoding request for: ${videoUrl}`);
+    log.transcode.info({ videoUrl, route: 'POST /transcode' }, 'Legacy transcode request');
 
     // Create temp directory
     await fs.promises.mkdir(tempDir, { recursive: true });
 
     // Download video (with optional Authorization header for OneDrive)
-    console.log('Downloading video...');
+    log.transcode.info({ videoUrl }, 'Downloading video');
     const headers = {};
     if (req.headers.authorization) {
       headers.Authorization = req.headers.authorization;
     }
-    
+
     const response = await axios({
       method: 'get',
       url: videoUrl,
@@ -417,13 +432,13 @@ app.post('/transcode', async (req, res) => {
       writer.on('error', reject);
     });
 
-    console.log('Video downloaded, transcoding...');
+    log.transcode.info({ videoUrl }, 'Video downloaded, transcoding');
 
     // Transcode with FFmpeg
     await transcodeVideo(inputPath, outputPath);
 
     const outputSize = fs.statSync(outputPath).size;
-    console.log(`Transcoding complete (${(outputSize / 1024 / 1024).toFixed(1)}MB), uploading to Supabase via tus...`);
+    log.transcode.info({ outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1) }, 'Transcode complete, uploading via tus');
 
     const fileName = `transcoded-${Date.now()}-${crypto.randomBytes(8).toString('hex')}.mp4`;
 
@@ -435,34 +450,33 @@ app.post('/transcode', async (req, res) => {
       .from('social-media-temp')
       .getPublicUrl(fileName);
 
-    console.log(`Upload complete: ${publicUrl}`);
+    log.upload.info({ publicUrl, fileName }, 'Upload complete');
 
     // Cleanup temp files
     await fs.promises.rm(tempDir, { recursive: true, force: true });
 
-    res.json({ 
+    res.json({
       transcodedUrl: publicUrl,
-      fileName: fileName 
+      fileName: fileName
     });
 
   } catch (error) {
-    console.error('Transcoding error:', error);
+    log.transcode.error({ err: error, videoUrl, route: 'POST /transcode' }, 'Legacy transcode failed');
 
     // Cleanup on error
     try {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
     } catch (cleanupError) {
-      console.error('Cleanup error:', cleanupError);
+      log.server.warn({ err: cleanupError, tempDir }, 'Temp directory cleanup failed');
     }
 
-    res.status(500).json({ 
-      error: 'Transcoding failed', 
-      message: error.message 
+    res.status(500).json({
+      error: 'Transcoding failed',
+      message: error.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Video transcoder service running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  log.server.info({ port: PORT, env: process.env.NODE_ENV || 'development' }, 'Video transcoder service started');
 });
