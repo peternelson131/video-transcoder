@@ -162,6 +162,7 @@ async function processVideo(jobId, videoRecord, userId) {
   const tempDir = path.join('/tmp', crypto.randomBytes(16).toString('hex'));
   const inputPath = path.join(tempDir, 'input.mp4');
   const outputPath = path.join(tempDir, 'output.mp4');
+  const startedProcessingAt = Date.now();
 
   try {
     jobStatus.set(jobId, { status: 'processing', step: 'downloading', progress: 0 });
@@ -193,19 +194,25 @@ async function processVideo(jobId, videoRecord, userId) {
     });
 
     const inputSize = fs.statSync(inputPath).size;
-    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1) }, 'Download complete, transcoding');
+    const downloadDurationMs = Date.now() - jobStatus.get(jobId)?._downloadStart || Date.now();
+    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1), durationMs: Date.now() - startedProcessingAt }, 'download-completed');
     jobStatus.set(jobId, { status: 'processing', step: 'transcoding', progress: 30 });
 
     // Transcode
+    const transcodeStart = Date.now();
     await transcodeVideo(inputPath, outputPath);
 
     const outputSize = fs.statSync(outputPath).size;
-    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1), outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1) }, 'Transcode complete');
+    const transcodeDurationMs = Date.now() - transcodeStart;
+    const compressionRatio = inputSize > 0 ? +(outputSize / inputSize).toFixed(2) : null;
+    log.transcode.info({ jobId, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1), outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1), durationMs: transcodeDurationMs, compressionRatio }, 'transcode-completed');
     jobStatus.set(jobId, { status: 'processing', step: 'uploading', progress: 70 });
 
     // Upload transcoded video
+    const uploadStart = Date.now();
     const transcodedFileName = `transcoded/${videoRecord.storage_path}`;
     await tusUpload('product-videos', outputPath, transcodedFileName, 'video/mp4');
+    log.upload.info({ jobId, fileName: transcodedFileName, fileSizeMB: +(outputSize / 1024 / 1024).toFixed(1), durationMs: Date.now() - uploadStart }, 'transcoded-upload-completed');
 
     // Get public URL of transcoded video
     const { data: { publicUrl: transcodedUrl } } = supabase.storage
@@ -228,7 +235,9 @@ async function processVideo(jobId, videoRecord, userId) {
       throw new Error(`Failed to update DB: ${updateError.message}`);
     }
 
-    log.transcode.info({ jobId, transcodedUrl, videoId: videoRecord.id }, 'Processing complete');
+    log.db.info({ jobId, videoId: videoRecord.id, status: 'completed' }, 'video-record-updated');
+    const totalDurationMs = Date.now() - startedProcessingAt;
+    log.transcode.info({ jobId, transcodedUrl, videoId: videoRecord.id, totalDurationMs, inputSizeMB: +(inputSize / 1024 / 1024).toFixed(1), outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1) }, 'processing-complete');
     jobStatus.set(jobId, {
       status: 'completed',
       step: 'done',
@@ -269,6 +278,7 @@ async function processVideo(jobId, videoRecord, userId) {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
+  log.server.info({ activeJobs: jobStatus.size }, 'health-check-served');
   res.json({ status: 'ok', service: 'video-transcoder', version: '2.0.0' });
 });
 
@@ -322,6 +332,8 @@ app.post('/api/video/register', async (req, res) => {
       log.db.error({ err: insertError, userId: auth.userId, storagePath }, 'Failed to create video record');
       throw new Error(`Failed to create video record: ${insertError.message}`);
     }
+
+    log.db.info({ videoId: videoRecord.id, userId: auth.userId, storagePath, productId: productId || null }, 'video-record-created');
 
     // Generate job ID
     const jobId = `job_${videoRecord.id}`;
@@ -404,6 +416,7 @@ app.post('/transcode', async (req, res) => {
   const outputPath = path.join(tempDir, 'output.mp4');
 
   try {
+    const legacyStart = Date.now();
     log.transcode.info({ videoUrl, route: 'POST /transcode' }, 'Legacy transcode request');
 
     // Create temp directory
@@ -450,10 +463,11 @@ app.post('/transcode', async (req, res) => {
       .from('social-media-temp')
       .getPublicUrl(fileName);
 
-    log.upload.info({ publicUrl, fileName }, 'Upload complete');
+    log.upload.info({ publicUrl, fileName, outputSizeMB: +(outputSize / 1024 / 1024).toFixed(1), totalDurationMs: Date.now() - legacyStart }, 'legacy-transcode-upload-complete');
 
     // Cleanup temp files
     await fs.promises.rm(tempDir, { recursive: true, force: true });
+    log.server.info({ route: 'POST /transcode', totalDurationMs: Date.now() - legacyStart }, 'legacy-transcode-completed');
 
     res.json({
       transcodedUrl: publicUrl,
